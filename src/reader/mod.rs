@@ -1,368 +1,395 @@
 mod reader;
 pub use self::reader::Reader;
 
-use std::io::Read;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
-use crate::{Error, Entry, Font, Glyph, font};
+use crate::{font, Entry, Error, Font, Glyph};
 
 /// Create a `Reader` from a `Read`.
 pub fn new<T: Read>(stream: T) -> Reader<T> {
-	Reader::from(stream)
+    Reader::from(stream)
 }
 
 /// Open a BDF file and read it into a `Font`.
 pub fn open<T: AsRef<Path>>(path: T) -> Result<Font, Error> {
-	read(File::open(path)?)
+    read(File::open(path)?)
 }
 
 /// Read a BDF stream into a `Font`.
 pub fn read<T: Read>(stream: T) -> Result<Font, Error> {
-	let mut font   = Font::default();
-	let mut reader = new(stream);
+    let mut font = Font::default();
+    let mut reader = new(stream);
 
-	let mut in_font  = false;
-	let mut in_props = false;
-	let mut in_char  = false;
+    let mut in_font = false;
+    let mut in_props = false;
+    let mut in_char = false;
 
-	let mut glyph = Glyph::default();
+    let mut skip_current_char = false;
 
-	loop {
-		let entry = reader.entry()?;
+    let mut glyph = Glyph::default();
 
-		if in_font {
-			if let Entry::EndFont = entry {
-				if in_char {
-					return Err(Error::MalformedChar);
-				}
+    loop {
+        let entry = match reader.entry() {
+            Ok(entry) => entry,
+            Err(Error::InvalidCodepoint) => {
+                // TODO: Log a warning or provide other programatic way of returning the warnings
+                skip_current_char = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
-				if in_props {
-					return Err(Error::MalformedProperties);
-				}
+        if in_font {
+            if let Entry::EndFont = entry {
+                if in_char {
+                    return Err(Error::MalformedChar);
+                }
 
-				if !font.validate() {
-					return Err(Error::MalformedFont);
-				}
+                if in_props {
+                    return Err(Error::MalformedProperties);
+                }
 
-				return Ok(font);
-			}
+                if !font.validate() {
+                    return Err(Error::MalformedFont);
+                }
 
-			if let Entry::StartProperties(..) = entry {
-				if in_char {
-					return Err(Error::MalformedChar);
-				}
+                return Ok(font);
+            }
 
-				in_props = true;
+            if let Entry::StartProperties(..) = entry {
+                if in_char {
+                    return Err(Error::MalformedChar);
+                }
 
-				continue;
-			}
+                in_props = true;
 
-			if in_props {
-				if let Entry::EndProperties = entry {
-					in_props = false;
+                continue;
+            }
 
-					continue;
-				}
+            if in_props {
+                if let Entry::EndProperties = entry {
+                    in_props = false;
 
-				if let Entry::Property(name, value) = entry {
-					font.properties_mut().insert(name, value);
+                    continue;
+                }
 
-					continue;
-				}
-				else {
-					return Err(Error::MalformedProperties);
-				}
-			}
+                if let Entry::Property(name, value) = entry {
+                    font.properties_mut().insert(name, value);
 
-			if let Entry::StartChar(name) = entry {
-				if in_props {
-					return Err(Error::MalformedProperties);
-				}
+                    continue;
+                } else {
+                    return Err(Error::MalformedProperties);
+                }
+            }
 
-				glyph.set_name(name);
-				in_char = true;
+            if let Entry::StartChar(name) = entry {
+                if in_props {
+                    return Err(Error::MalformedProperties);
+                }
 
-				continue;
-			}
+                glyph.set_name(name);
+                in_char = true;
 
-			if in_char {
-				if let Entry::EndChar = entry {
-					if !glyph.validate() {
-						return Err(Error::MalformedChar);
-					}
+                continue;
+            }
 
-					font.glyphs_mut().insert(glyph.codepoint(), glyph);
+            if in_char {
+                if let Entry::EndChar = entry {
+                    if skip_current_char {
+                        skip_current_char = false;
+                    } else {
+                        if !glyph.validate() {
+                            return Err(Error::MalformedChar);
+                        }
 
-					in_char = false;
-					glyph   = Glyph::default();
+                        font.glyphs_mut().insert(glyph.codepoint(), glyph);
+                    }
 
-					continue;
-				}
+                    in_char = false;
+                    glyph = Glyph::default();
 
-				match entry {
-					Entry::Encoding(codepoint) =>
-						glyph.set_codepoint(codepoint),
+                    continue;
+                }
 
-					Entry::ScalableWidth(x, y) =>
-						glyph.set_scalable_width(Some((x, y))),
+                match entry {
+                    Entry::Encoding(codepoint) => glyph.set_codepoint(codepoint),
 
-					Entry::DeviceWidth(x, y) =>
-						glyph.set_device_width(Some((x, y))),
+                    Entry::ScalableWidth(x, y) => glyph.set_scalable_width(Some((x, y))),
 
-					Entry::AlternateScalableWidth(x, y) =>
-						glyph.set_alternate_scalable_width(Some((x, y))),
+                    Entry::DeviceWidth(x, y) => glyph.set_device_width(Some((x, y))),
 
-					Entry::AlternateDeviceWidth(x, y) =>
-						glyph.set_alternate_device_width(Some((x, y))),
+                    Entry::AlternateScalableWidth(x, y) => {
+                        glyph.set_alternate_scalable_width(Some((x, y)))
+                    }
 
-					Entry::Vector(x, y) =>
-						glyph.set_vector(Some((x, y))),
+                    Entry::AlternateDeviceWidth(x, y) => {
+                        glyph.set_alternate_device_width(Some((x, y)))
+                    }
 
-					Entry::BoundingBox(bbx) =>
-						glyph.set_bounds(bbx),
+                    Entry::Vector(x, y) => glyph.set_vector(Some((x, y))),
 
-					Entry::Bitmap(map) =>
-						glyph.set_map(map),
+                    Entry::BoundingBox(bbx) => glyph.set_bounds(bbx),
 
-					_ =>
-						return Err(Error::MalformedChar)
-				}
+                    Entry::Bitmap(map) => glyph.set_map(map),
 
-				continue;
-			}
+                    _ => return Err(Error::MalformedChar),
+                }
 
-			match entry {
-				Entry::Comment(..) | Entry::Chars(..) =>
-					(),
+                continue;
+            }
 
-				Entry::ContentVersion(version) =>
-					font.set_version(Some(version)),
+            match entry {
+                Entry::Comment(..) | Entry::Chars(..) => (),
 
-				Entry::Font(name) =>
-					font.set_name(name),
+                Entry::ContentVersion(version) => font.set_version(Some(version)),
 
-				Entry::Size(pt, x, y) =>
-					font.set_size(font::Size { pt: pt, x: x, y: y }),
+                Entry::Font(name) => font.set_name(name),
 
-				Entry::FontBoundingBox(bbx) =>
-					font.set_bounds(bbx),
+                Entry::Size(pt, x, y) => font.set_size(font::Size { pt: pt, x: x, y: y }),
 
-				Entry::ScalableWidth(x, y) =>
-					font.set_scalable_width(Some((x, y))),
+                Entry::FontBoundingBox(bbx) => font.set_bounds(bbx),
 
-				Entry::DeviceWidth(x, y) =>
-					font.set_device_width(Some((x, y))),
+                Entry::ScalableWidth(x, y) => font.set_scalable_width(Some((x, y))),
 
-				Entry::AlternateScalableWidth(x, y) =>
-					font.set_alternate_scalable_width(Some((x, y))),
+                Entry::DeviceWidth(x, y) => font.set_device_width(Some((x, y))),
 
-				Entry::AlternateDeviceWidth(x, y) =>
-					font.set_alternate_device_width(Some((x, y))),
+                Entry::AlternateScalableWidth(x, y) => {
+                    font.set_alternate_scalable_width(Some((x, y)))
+                }
 
-				Entry::Vector(x, y) =>
-					font.set_vector(Some((x, y))),
+                Entry::AlternateDeviceWidth(x, y) => font.set_alternate_device_width(Some((x, y))),
 
-				_ =>
-					return Err(Error::MalformedFont)
-			}
+                Entry::Vector(x, y) => font.set_vector(Some((x, y))),
 
-			continue;
-		}
+                _ => return Err(Error::MalformedFont),
+            }
 
-		match entry {
-			Entry::Comment(..) => (),
+            continue;
+        }
 
-			Entry::StartFont(format) => {
-				font.set_format(format);
-				in_font = true;
-			}
+        match entry {
+            Entry::Comment(..) => (),
 
-			_ =>
-				return Err(Error::MalformedFont)
-		}
-	}
+            Entry::StartFont(format) => {
+                font.set_format(format);
+                in_font = true;
+            }
+
+            _ => return Err(Error::MalformedFont),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-	use crate::{Entry, BoundingBox, Bitmap, Property, Direction, reader};
+    use crate::{reader, Bitmap, BoundingBox, Direction, Entry, Property};
 
-	pub fn assert(string: &str, entry: Entry) {
-		let input = reader::new(string.as_bytes()).last().unwrap();
+    pub fn assert(string: &str, entry: Entry) {
+        let input = reader::new(string.as_bytes()).last().unwrap();
 
-		assert_eq!(input, entry);
-	}
+        assert_eq!(input, entry);
+    }
 
-	#[test]
-	fn start_font() {
-		assert("STARTFONT 2.2\n", Entry::StartFont("2.2".to_owned()));
-	}
+    #[test]
+    fn start_font() {
+        assert("STARTFONT 2.2\n", Entry::StartFont("2.2".to_owned()));
+    }
 
-	#[test]
-	fn comment() {
-		assert("COMMENT \"hue\"\n", Entry::Comment("hue".to_owned()));
-	}
+    #[test]
+    fn comment() {
+        assert("COMMENT \"hue\"\n", Entry::Comment("hue".to_owned()));
+    }
 
-	#[test]
-	fn content_version() {
-		assert("CONTENTVERSION 1.0.0\n", Entry::ContentVersion("1.0.0".to_owned()));
-	}
+    #[test]
+    fn content_version() {
+        assert(
+            "CONTENTVERSION 1.0.0\n",
+            Entry::ContentVersion("1.0.0".to_owned()),
+        );
+    }
 
-	#[test]
-	fn font() {
-		assert("FONT -Gohu-GohuFont-Bold-R-Normal--11-80-100-100-C-60-ISO10646-1\n",
-			Entry::Font("-Gohu-GohuFont-Bold-R-Normal--11-80-100-100-C-60-ISO10646-1".to_owned()));
-	}
+    #[test]
+    fn font() {
+        assert(
+            "FONT -Gohu-GohuFont-Bold-R-Normal--11-80-100-100-C-60-ISO10646-1\n",
+            Entry::Font("-Gohu-GohuFont-Bold-R-Normal--11-80-100-100-C-60-ISO10646-1".to_owned()),
+        );
+    }
 
-	#[test]
-	fn size() {
-		assert("SIZE 16 100 100\n", Entry::Size(16, 100, 100));
-	}
+    #[test]
+    fn size() {
+        assert("SIZE 16 100 100\n", Entry::Size(16, 100, 100));
+    }
 
-	#[test]
-	fn chars() {
-		assert("CHARS 42\n", Entry::Chars(42));
-	}
+    #[test]
+    fn chars() {
+        assert("CHARS 42\n", Entry::Chars(42));
+    }
 
-	#[test]
-	fn font_bounding_box() {
-		assert("FONTBOUNDINGBOX 6 11 0 -2\n",
-			Entry::FontBoundingBox(BoundingBox { width: 6, height: 11, x: 0, y: -2 }));
-	}
+    #[test]
+    fn font_bounding_box() {
+        assert(
+            "FONTBOUNDINGBOX 6 11 0 -2\n",
+            Entry::FontBoundingBox(BoundingBox {
+                width: 6,
+                height: 11,
+                x: 0,
+                y: -2,
+            }),
+        );
+    }
 
-	#[test]
-	fn end_font() {
-		assert("ENDFONT\n", Entry::EndFont);
-	}
+    #[test]
+    fn end_font() {
+        assert("ENDFONT\n", Entry::EndFont);
+    }
 
-	#[test]
-	fn start_properties() {
-		assert("STARTPROPERTIES 23\n", Entry::StartProperties(23));
-	}
+    #[test]
+    fn start_properties() {
+        assert("STARTPROPERTIES 23\n", Entry::StartProperties(23));
+    }
 
-	#[test]
-	fn property() {
-		assert("FOUNDRY \"GohuFont\"\n",
-			Entry::Property("FOUNDRY".to_owned(), Property::String("GohuFont".to_owned())));
+    #[test]
+    fn property() {
+        assert(
+            "FOUNDRY \"GohuFont\"\n",
+            Entry::Property(
+                "FOUNDRY".to_owned(),
+                Property::String("GohuFont".to_owned()),
+            ),
+        );
 
-		assert("X_HEIGHT 4\n",
-			Entry::Property("X_HEIGHT".to_owned(), Property::Integer(4)));
-	}
+        assert(
+            "X_HEIGHT 4\n",
+            Entry::Property("X_HEIGHT".to_owned(), Property::Integer(4)),
+        );
+    }
 
-	#[test]
-	fn end_properties() {
-		assert("ENDPROPERTIES\n", Entry::EndProperties);
-	}
+    #[test]
+    fn end_properties() {
+        assert("ENDPROPERTIES\n", Entry::EndProperties);
+    }
 
-	#[test]
-	fn start_char() {
-		assert("STARTCHAR <control>\n", Entry::StartChar("<control>".to_owned()));
-	}
+    #[test]
+    fn start_char() {
+        assert(
+            "STARTCHAR <control>\n",
+            Entry::StartChar("<control>".to_owned()),
+        );
+    }
 
-	#[test]
-	fn encoding() {
-		assert("ENCODING 0\n", Entry::Encoding('\u{0}'));
-	}
+    #[test]
+    fn encoding() {
+        assert("ENCODING 0\n", Entry::Encoding('\u{0}'));
+    }
 
-	#[test]
-	fn direction() {
-		assert("METRICSSET 0\n", Entry::Direction(Direction::Default));
-		assert("METRICSSET 1\n", Entry::Direction(Direction::Alternate));
-		assert("METRICSSET 2\n", Entry::Direction(Direction::Both));
-	}
+    #[test]
+    fn direction() {
+        assert("METRICSSET 0\n", Entry::Direction(Direction::Default));
+        assert("METRICSSET 1\n", Entry::Direction(Direction::Alternate));
+        assert("METRICSSET 2\n", Entry::Direction(Direction::Both));
+    }
 
-	#[test]
-	fn scalable_width() {
-		assert("SWIDTH 392 0\n", Entry::ScalableWidth(392, 0));
-	}
+    #[test]
+    fn scalable_width() {
+        assert("SWIDTH 392 0\n", Entry::ScalableWidth(392, 0));
+    }
 
-	#[test]
-	fn device_width() {
-		assert("DWIDTH 6 0\n", Entry::DeviceWidth(6, 0), );
-	}
+    #[test]
+    fn device_width() {
+        assert("DWIDTH 6 0\n", Entry::DeviceWidth(6, 0));
+    }
 
-	#[test]
-	fn alternate_scalable_width() {
-		assert("SWIDTH1 392 0\n", Entry::AlternateScalableWidth(392, 0));
-	}
+    #[test]
+    fn alternate_scalable_width() {
+        assert("SWIDTH1 392 0\n", Entry::AlternateScalableWidth(392, 0));
+    }
 
-	#[test]
-	fn alternate_device_width() {
-		assert("DWIDTH1 6 0\n", Entry::AlternateDeviceWidth(6, 0), );
-	}
+    #[test]
+    fn alternate_device_width() {
+        assert("DWIDTH1 6 0\n", Entry::AlternateDeviceWidth(6, 0));
+    }
 
-	#[test]
-	fn vector() {
-		assert("VVECTOR 6 0\n", Entry::Vector(6, 0), );
-	}
+    #[test]
+    fn vector() {
+        assert("VVECTOR 6 0\n", Entry::Vector(6, 0));
+    }
 
-	#[test]
-	fn bounding_box() {
-		assert("BBX 6 11 0 -2\n",
-			Entry::BoundingBox(BoundingBox { width: 6, height: 11, x: 0, y: -2 }));
-	}
+    #[test]
+    fn bounding_box() {
+        assert(
+            "BBX 6 11 0 -2\n",
+            Entry::BoundingBox(BoundingBox {
+                width: 6,
+                height: 11,
+                x: 0,
+                y: -2,
+            }),
+        );
+    }
 
-	#[test]
-	fn bitmap() {
-		let mut bitmap = Bitmap::new(6, 11);
+    #[test]
+    fn bitmap() {
+        let mut bitmap = Bitmap::new(6, 11);
 
-		// 00
+        // 00
 
-		// 70
-		bitmap.set(1, 1, true);
-		bitmap.set(2, 1, true);
-		bitmap.set(3, 1, true);
+        // 70
+        bitmap.set(1, 1, true);
+        bitmap.set(2, 1, true);
+        bitmap.set(3, 1, true);
 
-		// D8
-		bitmap.set(0, 2, true);
-		bitmap.set(1, 2, true);
-		bitmap.set(3, 2, true);
-		bitmap.set(4, 2, true);
+        // D8
+        bitmap.set(0, 2, true);
+        bitmap.set(1, 2, true);
+        bitmap.set(3, 2, true);
+        bitmap.set(4, 2, true);
 
-		// D8
-		bitmap.set(0, 3, true);
-		bitmap.set(1, 3, true);
-		bitmap.set(3, 3, true);
-		bitmap.set(4, 3, true);
+        // D8
+        bitmap.set(0, 3, true);
+        bitmap.set(1, 3, true);
+        bitmap.set(3, 3, true);
+        bitmap.set(4, 3, true);
 
-		// F8
-		bitmap.set(0, 4, true);
-		bitmap.set(1, 4, true);
-		bitmap.set(2, 4, true);
-		bitmap.set(3, 4, true);
-		bitmap.set(4, 4, true);
+        // F8
+        bitmap.set(0, 4, true);
+        bitmap.set(1, 4, true);
+        bitmap.set(2, 4, true);
+        bitmap.set(3, 4, true);
+        bitmap.set(4, 4, true);
 
-		// D8
-		bitmap.set(0, 5, true);
-		bitmap.set(1, 5, true);
-		bitmap.set(3, 5, true);
-		bitmap.set(4, 5, true);
+        // D8
+        bitmap.set(0, 5, true);
+        bitmap.set(1, 5, true);
+        bitmap.set(3, 5, true);
+        bitmap.set(4, 5, true);
 
-		// D8
-		bitmap.set(0, 6, true);
-		bitmap.set(1, 6, true);
-		bitmap.set(3, 6, true);
-		bitmap.set(4, 6, true);
+        // D8
+        bitmap.set(0, 6, true);
+        bitmap.set(1, 6, true);
+        bitmap.set(3, 6, true);
+        bitmap.set(4, 6, true);
 
-		// D8
-		bitmap.set(0, 7, true);
-		bitmap.set(1, 7, true);
-		bitmap.set(3, 7, true);
-		bitmap.set(4, 7, true);
+        // D8
+        bitmap.set(0, 7, true);
+        bitmap.set(1, 7, true);
+        bitmap.set(3, 7, true);
+        bitmap.set(4, 7, true);
 
-		// D8
-		bitmap.set(0, 8, true);
-		bitmap.set(1, 8, true);
-		bitmap.set(3, 8, true);
-		bitmap.set(4, 8, true);
+        // D8
+        bitmap.set(0, 8, true);
+        bitmap.set(1, 8, true);
+        bitmap.set(3, 8, true);
+        bitmap.set(4, 8, true);
 
-		// 00
+        // 00
 
-		// 00
+        // 00
 
-		assert(
-			"BBX 6 11 0 -2\n\
+        assert(
+            "BBX 6 11 0 -2\n\
 			 BITMAP\n\
 			 00\n\
 			 70\n\
@@ -375,17 +402,17 @@ mod tests {
 			 D8\n\
 			 00\n\
 			 00\n",
+            Entry::Bitmap(bitmap),
+        );
+    }
 
-			 Entry::Bitmap(bitmap));
-	}
+    #[test]
+    fn end_char() {
+        assert("ENDCHAR\n", Entry::EndChar);
+    }
 
-	#[test]
-	fn end_char() {
-		assert("ENDCHAR\n", Entry::EndChar);
-	}
-
-	#[test]
-	fn unknown() {
-		assert("HUE", Entry::Unknown("HUE".to_owned()));
-	}
+    #[test]
+    fn unknown() {
+        assert("HUE", Entry::Unknown("HUE".to_owned()));
+    }
 }
